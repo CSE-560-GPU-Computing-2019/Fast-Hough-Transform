@@ -1,22 +1,28 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 
-#include <iostream>
 #include "stb_image.h"
 #include "stb_image_write.h"
+#include "arraylist.h"
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <iostream>
 
 #define PI 3.14159265
 #define imgchannels 3
 
 #define KERNEL_COLUMNS 5
 #define KERNEL_ROWS 5
-#define BLOCK_SIZE 8
-#define SHARED_MEM_WIDTH (BLOCK_SIZE + KERNEL_COLUMNS)
+#define BLOCK_SIZE_2D 32
+#define BLOCK_SIZE_3D 8
+#define SHARED_MEM_WIDTH (BLOCK_SIZE_2D + KERNEL_COLUMNS)
 
 using namespace std;
+// __device__ ArrayList* rtable[180];
+double* rtable[181];
+int pointer[181];
+
 
 void convert_to_grayscale(const unsigned char*inputImage, unsigned char * outputImageData, int height, int width, int channels)
 {
@@ -70,7 +76,7 @@ __global__ void thresholdKernel(const unsigned char*InputImageData, unsigned cha
   }
 }
 
-__global__ void sobelKernel(const unsigned char*InputImageData, unsigned char * outputImageData, unsigned char * outputGradient, int height, int width)
+__global__ void sobelKernel(const unsigned char*InputImageData, unsigned char * outputImageData, unsigned int * outputGradient, int height, int width)
 {
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -112,10 +118,10 @@ __global__ void sobelKernel(const unsigned char*InputImageData, unsigned char * 
         h /= 5;
         v /= 5;
         float val = (float)sqrt((h*h) + (v*v));
-        float gradient = atan(v / h);
+        float gradient = atan(v / (h+0.000001));
         
         outputImageData[y*width+x] = val;
-        outputGradient[y*width+x] = gradient * 180 / PI;
+        outputGradient[y*width+x] = (gradient * 180 / PI) + 90;
     }
 }
 
@@ -171,7 +177,54 @@ float * get_avg_kernel() {
   return h_kernel_data;
 }
 
-__global__ void accumulator(unsigned char* image, int * accum, int height, int width, int num_radii) {
+__global__ void rtable_init_kernel(double** rtable, int *pointer, int initSize) {
+
+  int tidx = threadIdx.x + blockDim.x * blockIdx.x;
+  rtable[tidx] = (double*) malloc(initSize * sizeof(double));
+  memset(rtable[tidx], 0, initSize * sizeof(double));
+  pointer[tidx] = 0;
+}
+
+__global__ void rtable_create_kernel(double**rtable, int* pointer, unsigned char * template_edge, unsigned int * template_orientation, int height, int width, double centroid_x, double centroid_y) {
+  int tidx = threadIdx.x + blockDim.x * blockIdx.x;
+  unsigned int orientation = template_orientation[tidx];
+  unsigned int edge = template_edge[tidx];
+  if (edge != 0) {
+    rtable[orientation][pointer[orientation]] = (tidx % width) - centroid_x;
+    rtable[orientation][pointer[orientation]+1] = (tidx / width) - centroid_y;
+    pointer[orientation]+=2;
+  }
+}
+
+__global__ void rtable_print_kernel(double** rtable, int* pointer) {
+  int tidx = threadIdx.x + blockDim.x * blockIdx.x;
+  for(int index =0; index<pointer[tidx]/2; index++) {
+    printf("(%.3f, %.3f) ", rtable[tidx][2*index], rtable[tidx][2*index+1]);
+  }
+  printf("\n");
+  }
+
+__global__ void accumulator_general(unsigned char* image, int * accum, int height, int width, int num_angle, int* pointer, double** rtable) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+  int theta = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if(image[y*width+x] != 0) {
+    double *list = rtable[theta];
+    for(int index =0; index<pointer[theta]/2; index++) {
+      float vec_x = list[2*index];
+      float vec_y = list[2*index+1];
+      int x0 = (int) (x + vec_x);
+      int y0 = (int) (y + vec_y);
+      if (x0 >= 0 and x0 < width && y0 >=0 && y0 < height) {
+        atomicAdd(&accum[(y0*width+x0)*num_angle+theta], 1);
+      }
+    }
+  }
+}
+
+
+__global__ void accumulator_circle(unsigned char* image, int * accum, int height, int width, int num_radii) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
   int r = blockIdx.z * blockDim.z + threadIdx.z;
@@ -211,9 +264,15 @@ __global__ void threshold(int * accum, int height, int width, int num_radii, int
 
 int main()
 {
+
+  cudaEvent_t start_kernel, stop_kernel;
+  cudaEventCreate(&start_kernel);
+  cudaEventCreate(&stop_kernel);
+
+
   int width, height, bpp;
 
-  string filename = "images/input.png";
+  string filename = "input3.png";
   string outname = "output/hi.png";
   unsigned char *img;
   const unsigned char* image = stbi_load(filename.c_str(), &width, &height, &bpp, imgchannels);
@@ -225,7 +284,7 @@ int main()
   /**********************CUDA-CODE*************************************/
   string gpu_out_edge = "output/hi_gpu_edge.png";
   string gpu_out_edge_thresholded = "output/hi_gpu_edge_thresholded.png";
-  string gpu_out_orientation = "output/hi_gpu_orientation.png";
+  // string gpu_out_orientation = "output/hi_gpu_orientation.png";
   string gpu_blurred_image = "output/hi_gpu_blurred_image.png";
   string gpu_accum_image = "output/hi_gpu_accum_image.png";
 
@@ -242,8 +301,8 @@ int main()
   unsigned char * d_output_edge_thresholded;
   cudaMalloc(&d_output_edge_thresholded, width*height*sizeof(unsigned char));
 
-  unsigned char * d_output_orientation;
-  cudaMalloc(&d_output_orientation, width*height*sizeof(unsigned char));
+  unsigned int * d_output_orientation;
+  cudaMalloc(&d_output_orientation, width*height*sizeof(unsigned int));
 
   unsigned char * d_blurred_image;
   cudaMalloc(&d_blurred_image, width*height*sizeof(unsigned char));
@@ -252,29 +311,59 @@ int main()
   cudaMalloc(&d_kernel_data, KERNEL_ROWS*KERNEL_COLUMNS*sizeof(float));
   cudaMemcpy(d_kernel_data, get_avg_kernel(), KERNEL_ROWS*KERNEL_COLUMNS*sizeof(float), cudaMemcpyHostToDevice);
 
-  const dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE, 1);
-  const int bx = ceil( (float) width/BLOCK_SIZE);
-  const int by = ceil( (float) height/BLOCK_SIZE);
+  const dim3 blockSize(BLOCK_SIZE_2D, BLOCK_SIZE_2D, 1);
+  const int bx = ceil( (float) width/BLOCK_SIZE_2D);
+  const int by = ceil( (float) height/BLOCK_SIZE_2D);
   const dim3 gridSize = dim3(bx, by);
 
   grayscaleKernel<<<gridSize, blockSize>>>(d_input, d_output, height, width, imgchannels);
   convKernel<<<gridSize, blockSize>>>(d_output, d_kernel_data, d_blurred_image, height, width);
   sobelKernel<<<gridSize, blockSize>>>(d_blurred_image, d_output_edge, d_output_orientation, height, width);
-  thresholdKernel<<<gridSize, blockSize>>>(d_output_edge, d_output_edge_thresholded, height, width, 1, 50);
+  thresholdKernel<<<gridSize, blockSize>>>(d_output_edge, d_output_edge_thresholded, height, width, 1, 10);
 
   int num_radii = 100;
 
-  const dim3 blockSize_accum(BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE);
-  const int bx_accum = ceil( (float) width/BLOCK_SIZE);
-  const int by_accum = ceil( (float) height/BLOCK_SIZE);
-  const int bz_accum = ceil( (float) num_radii/BLOCK_SIZE);
+  const dim3 blockSize_accum(BLOCK_SIZE_3D, BLOCK_SIZE_3D, BLOCK_SIZE_3D);
+  const int bx_accum = ceil( (float) width/BLOCK_SIZE_3D);
+  const int by_accum = ceil( (float) height/BLOCK_SIZE_3D);
+  const int bz_accum = ceil( (float) num_radii/BLOCK_SIZE_3D);
   const dim3 gridSize_accum = dim3(bx_accum, by_accum, bz_accum);
 
   int * d_accum;
   cudaMalloc(&d_accum, width*height*num_radii*sizeof(int));  
   cudaMemset(d_accum, 0, width*height*num_radii*sizeof(int));
-  accumulator<<<gridSize_accum, blockSize_accum>>>(d_output_edge_thresholded, d_accum, height, width, num_radii);
-  threshold<<<gridSize_accum, blockSize_accum>>>(d_accum, height, width, num_radii, 20);
+
+  // ----------------------------------------------------------------------------------------------------
+
+  printf("1\n");
+  double** d_rtable;
+  int* d_pointer;
+  int num_angles = 181;
+
+  cudaMalloc(&d_rtable, num_angles*sizeof(double*));
+  cudaMalloc(&d_pointer, num_angles*sizeof(int));
+  rtable_init_kernel<<<1, num_angles>>>(d_rtable, d_pointer, 1000);
+  rtable_create_kernel<<<gridSize, blockSize>>>(d_rtable, d_pointer, d_output_edge, d_output_orientation, height, width, width/2, height/2);
+  cudaDeviceSynchronize();
+
+  int * d_accum_general;  
+  cudaMalloc(&d_accum_general, width*height*num_angles*sizeof(int));  
+  cudaMemset(d_accum_general, 0, width*height*num_angles*sizeof(int));
+  cudaEventRecord(start_kernel);
+  accumulator_general<<<gridSize_accum, blockSize_accum>>>(d_output_edge_thresholded, d_accum_general, height, width, 181, d_pointer, d_rtable);
+  cudaDeviceSynchronize();
+  cudaEventRecord(stop_kernel);
+  
+  printf("2\n");
+
+  cudaEventSynchronize(stop_kernel);
+  float k_time ;
+  cudaEventElapsedTime(&k_time, start_kernel, stop_kernel);
+  cout << "GPU Time: " << k_time << " milliseconds" << endl;
+  // ----------------------------------------------------------------------------------------------------
+
+  accumulator_circle<<<gridSize_accum, blockSize_accum>>>(d_output_edge_thresholded, d_accum, height, width, num_radii);
+  threshold<<<gridSize_accum, blockSize_accum>>>(d_accum_general, height, width, num_radii, 20);
 
   unsigned char * h_blurred_image = (unsigned char *) malloc(width*height*sizeof(unsigned char));
   cudaMemcpy(h_blurred_image, d_blurred_image, width*height*sizeof(unsigned char), cudaMemcpyDeviceToHost);
@@ -285,8 +374,8 @@ int main()
   unsigned char * h_output_edge_thresholded = (unsigned char *) malloc(width*height*sizeof(unsigned char));
   cudaMemcpy(h_output_edge_thresholded, d_output_edge_thresholded, width*height*sizeof(unsigned char), cudaMemcpyDeviceToHost);
 
-  unsigned char * h_output_orientation = (unsigned char *) malloc(width*height*sizeof(unsigned char));
-  cudaMemcpy(h_output_orientation, d_output_orientation, width*height*sizeof(unsigned char), cudaMemcpyDeviceToHost);
+  unsigned int * h_output_orientation = (unsigned int *) malloc(width*height*sizeof(unsigned int));
+  cudaMemcpy(h_output_orientation, d_output_orientation, width*height*sizeof(unsigned int), cudaMemcpyDeviceToHost);
 
   int * h_accum = (int *) malloc(width*height*num_radii*sizeof(int));
   cudaMemcpy(h_accum, d_accum, width*height*num_radii*sizeof(int), cudaMemcpyDeviceToHost);
@@ -296,8 +385,9 @@ int main()
   stbi_write_png(gpu_blurred_image.c_str(), width, height, 1, h_blurred_image, 0);
   stbi_write_png(gpu_out_edge.c_str(), width, height, 1, h_output_edge, 0);
   stbi_write_png(gpu_out_edge_thresholded.c_str(), width, height, 1, h_output_edge_thresholded, 0);
-  stbi_write_png(gpu_out_orientation.c_str(), width, height, 1, h_output_orientation, 0);
+  // stbi_write_png(gpu_out_orientation.c_str(), width, height, 1, h_output_orientation, 0);
   stbi_write_png(gpu_accum_image.c_str(), width, height, 1, accum_image, 0);
+
   cudaFree(d_input);
   cudaFree(d_output);
   cudaFree(d_output_edge);
